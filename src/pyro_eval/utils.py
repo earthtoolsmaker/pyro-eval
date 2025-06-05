@@ -1,12 +1,16 @@
+import logging
+import matplotlib.pyplot as plt
+import numpy as np
 import os
 import random
 import re
+import time
 from datetime import datetime
+from functools import wraps
 from pathlib import PosixPath
-import matplotlib.pyplot as plt
-import numpy as np
 from pandas import Timedelta
 from ultralytics import YOLO
+
 
 EXTENSIONS = [".jpg", ".png", ".tif", ".jpeg", ".tiff"]
 
@@ -74,6 +78,9 @@ def make_dict_json_compatible(data):
     elif np.issubdtype(type(data), np.integer):
         # Convert int64 in native int
         return int(data)
+    elif np.issubdtype(type(data), np.float32):
+        # Convert int64 in native int
+        return float(data)
     elif isinstance(data, np.ndarray):
         return data.tolist()
     else:
@@ -258,3 +265,16 @@ def generate_run_id():
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     rand_suffix = random.randint(1000, 9999)
     return f"run-{timestamp}-{rand_suffix}"
+
+
+def timing(name: str):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            start = time.time()
+            result = func(*args, **kwargs)
+            end = time.time()
+            logging.info(f"{name} executed in {end - start:.4f} seconds")
+            return result
+        return wrapper
+    return decorator

@@ -1,9 +1,7 @@
 import json
 import logging
 import os
-import random
 from collections import deque
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -12,7 +10,8 @@ from sklearn.metrics import confusion_matrix, f1_score, precision_score, recall_
 
 from .data_structures import Sequence
 from .dataset import EvaluationDataset
-from .utils import compute_metrics, export_model, make_dict_json_compatible
+from .path_manager import get_prediction_path
+from .utils import compute_metrics, export_model, generate_run_id, make_dict_json_compatible, timing
 
 logging.getLogger("pyroengine.engine").setLevel(logging.WARNING)
 
@@ -27,6 +26,7 @@ class EngineEvaluator:
         save: bool = False,
         run_id: str = None,
         resume: bool = True,
+        use_existing_predictions: bool = True
     ):
 
         self.dataset = dataset
@@ -34,7 +34,7 @@ class EngineEvaluator:
         self.save = (
             save  # If save is True we regularly dump results and the config used
         )
-        self.run_id = run_id if run_id else self.generate_run_id()
+        self.run_id = run_id if run_id else generate_run_id()
         self.resume = resume  # If True, we look for partial results in results/<run_id>
         self.results_data = [
             "sequence_id",
@@ -51,6 +51,11 @@ class EngineEvaluator:
         self.needs_deletion = False
         self.run_model_path = None
         self.engine = self.instanciate_engine()
+        self.prediction_file = get_prediction_path(self.model_path)
+        self.use_existing_predictions = use_existing_predictions
+
+        # Retrieve images from the dataset
+        self.images = self.dataset.get_all_images()
 
     def instanciate_engine(self):
         """
@@ -78,6 +83,40 @@ class EngineEvaluator:
 
         return engine
 
+    def load_predictions(self):
+        """
+        Load prediction from a json file.
+        Predictions are saved in a json named following the model path.
+        """
+        if not os.path.isfile(self.prediction_file):
+            logging.info(f"Prediction file not found : {self.prediction_file}")
+            logging.info("Running predictions.")
+        else:
+            # Load predictions from json file
+            with open(self.prediction_file, 'r') as fp:
+                predictions = json.load(fp)
+
+            for image in self.images:
+                if image.name in predictions:
+                    image.prediction = np.array(predictions[image.name])
+
+    def update_predictions(self, missing_predictions):
+        """
+        Computes missing predictions and saves them for later engine evaluation
+        """
+        new_predictions = {}
+        for image in missing_predictions:
+            image.prediction = self.model.inference(image)
+            new_predictions[image.name] = image.prediction
+
+        with open(self.prediction_file, 'w') as fp:
+            all_predictions = json.load(fp)
+        
+        all_predictions.update(new_predictions)
+        # Save predictions for later use
+        with open(self.prediction_file, 'w') as fp:
+            json.dump(make_dict_json_compatible(all_predictions), fp)
+
     def run_engine_sequence(self, sequence: Sequence):
         """
         Instanciate an Engine and run predictions on a Sequence containing a list of images.
@@ -88,11 +127,22 @@ class EngineEvaluator:
         # TODO : better handle default values
 
         sequence_results = pd.DataFrame(columns=self.results_data)
-
+        missing_predictions = []
         for image in sequence.images:
             pil_image = image.load()
             # Run prediction on a single image
-            confidence = self.engine.predict(pil_image)
+
+            if self.use_existing_predictions:
+                if image.prediction is not None:
+                    # Use the previously computed prediction stored in the prediciton json file
+                    confidence = self.engine.predict(frame=None, fake_pred=image.prediction[:4])
+                else:
+                    missing_predictions.append(image)
+                    confidence = self.engine.predict(pil_image)
+            else:
+                # Run the prediction from the Engine
+                confidence = self.engine.predict(pil_image)
+
             sequence_results.loc[len(sequence_results)] = [
                 sequence.sequence_id,  # sequence_id
                 image.path,  # image
@@ -104,11 +154,14 @@ class EngineEvaluator:
                 image.timedelta,  # timedelta
             ]
 
+        self.update_predictions(missing_predictions=missing_predictions)
         # Clear states to reset the engine for the next sequence
         self.engine._states = {
             "-1": {
-                "last_predictions": deque([], self.config["nb_consecutive_frames"]),
+                "last_predictions": deque(maxlen=self.config["nb_consecutive_frames"]),
                 "ongoing": False,
+                "last_image_sent": None,
+                "last_bbox_mask_fetch": None,
             },
         }
         return sequence_results
@@ -284,8 +337,8 @@ class EngineEvaluator:
             "predictions": predictions,
         }
 
+    @timing("Engine evaluation")
     def evaluate(self):
-
         # Run Engine predictions on each sequence of the dataset
         self.run_engine_dataset()
 
@@ -302,11 +355,3 @@ class EngineEvaluator:
                 json.dump(make_dict_json_compatible(self.metrics), fip)
 
         return self.metrics
-
-    def generate_run_id(self):
-        """
-        Generates a unique run_id to store results
-        """
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        rand_suffix = random.randint(1000, 9999)
-        return f"run-{timestamp}-{rand_suffix}"

@@ -1,7 +1,6 @@
 import json
+import inspect
 import logging
-import random
-from datetime import datetime
 from pathlib import Path
 from typing import Dict
 
@@ -60,24 +59,35 @@ class EvaluationPipeline:
         Assign default parameters to config dict
         Get the default parameters from an Engine and Classifier instances
         """
-        dummy_engine = Engine()
-        dummy_model = Classifier()
+
+        def get_default_values(class_name):
+            signature = inspect.signature(class_name.__init__)
+
+            return {
+                name: param.default
+                for name, param in signature.parameters.items()
+                if param.default is not inspect.Parameter.empty and name != 'self'
+            }
+
+        engine_default_values = get_default_values(Engine)
+        model_default_values = get_default_values(Classifier)
 
         engine_config = config.get("engine", {})
         engine_config.setdefault("model_path", config.get("model_path"))
-        engine_config.setdefault("nb_consecutive_frames", dummy_engine.nb_consecutive_frames)
-        engine_config.setdefault("conf_thresh", dummy_engine.conf_thresh)
-        engine_config.setdefault("max_bbox_size", dummy_model.max_bbox_size)
+        engine_config.setdefault("nb_consecutive_frames", engine_default_values["nb_consecutive_frames"])
+        engine_config.setdefault("conf_thresh", engine_default_values["conf_thresh"])
+        engine_config.setdefault("max_bbox_size", model_default_values["max_bbox_size"])
 
         model_config = config.get("model", {})
         model_config.setdefault("model_path", config.get("model_path"))
-        model_config.setdefault("iou", dummy_model.iou)
-        model_config.setdefault("conf", dummy_model.conf)
-        model_config.setdefault("imgsz", dummy_model.imgsz)
+        model_config.setdefault("iou", model_default_values["iou"])
+        model_config.setdefault("conf", model_default_values["conf"])
+        model_config.setdefault("imgsz", model_default_values["imgsz"])
 
         config.setdefault("eval", ["model", "engine"])
         config["engine"] = engine_config
         config["model"] = engine_config
+
         return config
 
     def run(self):

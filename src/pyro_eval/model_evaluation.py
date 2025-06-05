@@ -9,7 +9,8 @@ import numpy as np
 from .dataset import EvaluationDataset
 from .data_structures import CustomImage
 from .model import Model
-from .utils import compute_metrics, make_dict_json_compatible, find_matches
+from .path_manager import get_prediction_path
+from .utils import compute_metrics, find_matches, make_dict_json_compatible, timing
 
 
 class ModelEvaluator:
@@ -42,22 +43,7 @@ class ModelEvaluator:
             "fn": [],
         }
 
-        self.prediction_file = self.get_prediction_path()
-
-    def get_prediction_path(self):
-        abs_model_path = Path(self.model_path).resolve()
-        output_dir = Path("data/predictions")
-
-        # Try to take the relative path from the models folder, only work if the model path points to this folder
-        try:
-            relative = abs_model_path.relative_to(abs_model_path.parents[abs_model_path.parts.index("models")])
-        except ValueError:
-            # otherwise we use only the last subfolders
-            relative = Path(*abs_model_path.parts[-2:])
-
-        output_name = "_".join(relative.parts).replace(".pt", "") + ".json"
-
-        return output_dir / output_name
+        self.prediction_file = get_prediction_path(self.model_path)
 
     def run_predictions(self, image_list : List[CustomImage] = None):
         """
@@ -73,9 +59,8 @@ class ModelEvaluator:
             predictions[image.name] = image.prediction
 
         # Save predictions for later use
-        if not os.path.isfile(self.prediction_file):
-            with open(self.prediction_file, 'w') as fp:
-                json.dump(make_dict_json_compatible(predictions), fp)
+        with open(self.prediction_file, 'w') as fp:
+            json.dump(make_dict_json_compatible(predictions), fp)
 
     def load_predictions(self):
         """
@@ -114,6 +99,7 @@ class ModelEvaluator:
         else:
             self.predictions["tn"].append(image_path)
 
+    @timing("Model evaluation")
     def evaluate(self):
         """
         Compares predictions and labels to evaluate the model performance on the dataset
