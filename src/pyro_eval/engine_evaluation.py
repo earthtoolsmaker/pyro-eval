@@ -1,9 +1,7 @@
 import json
 import logging
 import os
-import random
 from collections import deque
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -12,7 +10,10 @@ from sklearn.metrics import confusion_matrix, f1_score, precision_score, recall_
 
 from .data_structures import Sequence
 from .dataset import EvaluationDataset
-from .utils import compute_metrics, export_model, make_dict_json_compatible
+from .model import Model
+from .path_manager import get_prediction_csv
+from .prediction_manager import PredictionManager
+from .utils import compute_metrics, export_model, generate_run_id, make_dict_json_compatible, timing
 
 logging.getLogger("pyroengine.engine").setLevel(logging.WARNING)
 
@@ -23,19 +24,20 @@ class EngineEvaluator:
     def __init__(
         self,
         dataset: EvaluationDataset,
+        model: Model,
+        prediction_manager: PredictionManager,
         config: dict = {},
         save: bool = False,
         run_id: str = None,
-        resume: bool = True,
+        device: str = None,
     ):
 
         self.dataset = dataset
-        self.config = config
-        self.save = (
-            save  # If save is True we regularly dump results and the config used
-        )
-        self.run_id = run_id if run_id else self.generate_run_id()
-        self.resume = resume  # If True, we look for partial results in results/<run_id>
+        self.model = model
+        self.prediction_manager = prediction_manager
+        self.config = config["engine"]
+        self.save = save  # If save is True we regularly dump results and the config used
+        self.run_id = run_id if run_id else generate_run_id()
         self.results_data = [
             "sequence_id",
             "image",
@@ -46,11 +48,33 @@ class EngineEvaluator:
             "confidence",
             "timedelta",
         ]
-        self.predictions_csv = ""
         self.model_path = self.config.get("model_path", None)
         self.needs_deletion = False
         self.run_model_path = None
         self.engine = self.instanciate_engine()
+        self.device = device
+
+        # Retrieve images from the dataset
+        self.images = self.dataset.get_all_images()
+
+    @timing("Engine evaluation")
+    def evaluate(self):
+        # Run Engine predictions on each sequence of the dataset
+        self.run_engine_dataset()
+
+        # Compute metrics from predictions
+        self.metrics = {
+            "run_id": self.run_id,
+            "image_metrics": self.compute_image_level_metrics(),
+            "sequence_metrics": self.compute_sequence_level_metrics(),
+        }
+
+        # Save metrics in a json file
+        if self.save:
+            with open(os.path.join(self.result_dir, "engine_metrics.json"), "w") as fip:
+                json.dump(make_dict_json_compatible(self.metrics), fip)
+
+        return self.metrics
 
     def instanciate_engine(self):
         """
@@ -88,11 +112,18 @@ class EngineEvaluator:
         # TODO : better handle default values
 
         sequence_results = pd.DataFrame(columns=self.results_data)
+        missing_predictions = []
 
         for image in sequence.images:
-            pil_image = image.load()
             # Run prediction on a single image
-            confidence = self.engine.predict(pil_image)
+            if image.prediction is not None:
+                # Use the previously computed prediction stored in the prediciton json file
+                confidence = self.engine.predict(frame=None, fake_pred=np.array(image.prediction[:4]))
+            else:
+                pil_image = image.load()
+                missing_predictions.append(image)
+                confidence = self.engine.predict(pil_image)
+
             sequence_results.loc[len(sequence_results)] = [
                 sequence.sequence_id,  # sequence_id
                 image.path,  # image
@@ -104,11 +135,16 @@ class EngineEvaluator:
                 image.timedelta,  # timedelta
             ]
 
+        # We run and save the predicitons on the missing images to be able to later load them 
+        self.prediction_manager.predict(images=missing_predictions)
+
         # Clear states to reset the engine for the next sequence
         self.engine._states = {
             "-1": {
-                "last_predictions": deque([], self.config["nb_consecutive_frames"]),
+                "last_predictions": deque(maxlen=self.config["nb_consecutive_frames"]),
                 "ongoing": False,
+                "last_image_sent": None,
+                "last_bbox_mask_fetch": None,
             },
         }
         return sequence_results
@@ -118,38 +154,16 @@ class EngineEvaluator:
         Function that processes predictions through the Engine on sequences of images
         """
 
-        if self.save:
-            # Csv file where detailed predictions are dumped
-            self.result_dir = os.path.join(
-                os.path.dirname(__file__), "data/results/engine", self.run_id
-            )
-            os.makedirs(self.result_dir, exist_ok=True)
-            self.predictions_csv = os.path.join(self.result_dir, "results.csv")
-
-        # Previous predictions are loaded if they exist and if resume is set to True
-        # FIXME : this doesn't work predictions are re-run every time
-        if os.path.isfile(self.predictions_csv) and self.resume:
-            logging.info(f"Loading previous predictions in {self.predictions_csv}")
-            self.predictions_df = pd.read_csv(self.predictions_csv)
-        else:
-            self.predictions_df = pd.DataFrame(columns=self.results_data)
+        self.predictions_df = pd.DataFrame(columns=self.results_data)
 
         try:
             for sequence in self.dataset:
-                if self.resume and sequence.sequence_id in set(
-                    self.predictions_df["sequence_id"].to_list()
-                ):
-                    logging.info(
-                        f"Results of {sequence} found in predictions csv, sequence skipped."
-                    )
-                    continue
                 sequence_results = self.run_engine_sequence(sequence)
 
                 # Add sequence results to result dataframe
                 self.predictions_df = pd.concat([self.predictions_df, sequence_results])
-                # Checkpoint to save predictions every 50 images
-                if self.save and len(self.predictions_df) % 50 == 0:
-                    self.predictions_df.to_csv(self.predictions_csv, index=False)
+                # Checkpoint to save predictions regularly
+                self.prediction_manager.save_predictions()
 
         finally:
             if self.needs_deletion:
@@ -160,9 +174,13 @@ class EngineEvaluator:
                         f"Temporary model file could not be removed : {self.run_model_path}"
                     )
 
+        # Final saving of the predictions
+        self.prediction_manager.save_predictions()
+
         if self.save:
-            logging.info(f"Saving predictions in {self.predictions_csv}")
-            self.predictions_df.to_csv(self.predictions_csv, index=False)
+            pred_csv = get_prediction_csv(self.run_id)
+            logging.info(f"Saving predictions in {pred_csv}")
+            self.predictions_df.to_csv(pred_csv, index=False)
 
     def compute_image_level_metrics(self):
         """
@@ -284,29 +302,3 @@ class EngineEvaluator:
             "predictions": predictions,
         }
 
-    def evaluate(self):
-
-        # Run Engine predictions on each sequence of the dataset
-        self.run_engine_dataset()
-
-        # Compute metrics from predictions
-        self.metrics = {
-            "run_id": self.run_id,
-            "image_metrics": self.compute_image_level_metrics(),
-            "sequence_metrics": self.compute_sequence_level_metrics(),
-        }
-
-        # Save metrics in a json file
-        if self.save:
-            with open(os.path.join(self.result_dir, "engine_metrics.json"), "w") as fip:
-                json.dump(make_dict_json_compatible(self.metrics), fip)
-
-        return self.metrics
-
-    def generate_run_id(self):
-        """
-        Generates a unique run_id to store results
-        """
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        rand_suffix = random.randint(1000, 9999)
-        return f"run-{timestamp}-{rand_suffix}"

@@ -1,7 +1,5 @@
 import json
 import logging
-import random
-from datetime import datetime
 from pathlib import Path
 from typing import Dict
 
@@ -11,8 +9,11 @@ from pyroengine.vision import Classifier
 
 from .dataset import EvaluationDataset
 from .engine_evaluation import EngineEvaluator
+from .model import Model
 from .model_evaluation import ModelEvaluator
-from .utils import make_dict_json_compatible, generate_run_id
+from .path_manager import get_prediction_path
+from .prediction_manager import PredictionManager
+from .utils import make_dict_json_compatible, generate_run_id, get_class_default_params
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -25,7 +26,6 @@ class EvaluationPipeline:
         dataset: Dict[str, EvaluationDataset],
         config: dict = {},
         run_id: str = "",
-        resume: bool = False,
         device: str | None = None,
         use_existing_predictions: bool = True,
     ):
@@ -33,26 +33,38 @@ class EvaluationPipeline:
         self.model_dataset = dataset.get("model")
         self.engine_dataset = dataset.get("engine")
         self.config = self.get_config(config)
+        self.model_path = self.config["model_path"]
         self.run_id = run_id or generate_run_id()
         self.metrics = {}
+
+        # Load model
+        self.model = Model(self.model_path, self.config, device)
+
+        # Object used to store and manage predictions (load, update, save)
+        self.prediction_manager = PredictionManager(
+            model=self.model,
+            prediction_file=get_prediction_path(self.model.hash),
+            use_existing_predictions=use_existing_predictions
+        )
 
         # Evaluate the model performance on single images
         if "model" in self.config["eval"]:
             self.model_evaluator = ModelEvaluator(
                 dataset=self.model_dataset,
-                config=self.config["model"],
-                device=device,
-                use_existing_predictions=use_existing_predictions
+                model=self.model,
+                prediction_manager=self.prediction_manager,
+                config=self.config,
             )
 
         # Evaluate the engine performance on series of images
         if "engine" in self.config["eval"]:
             self.engine_evaluator = EngineEvaluator(
                 dataset=self.engine_dataset,
-                config=self.config["model"],
+                model=self.model,
+                prediction_manager=self.prediction_manager,
+                config=self.config,
                 run_id=self.run_id,
-                resume=resume,
-                use_existing_predictions=use_existing_predictions
+                device=device,
             )
 
     def get_config(self, config):
@@ -60,24 +72,28 @@ class EvaluationPipeline:
         Assign default parameters to config dict
         Get the default parameters from an Engine and Classifier instances
         """
-        dummy_engine = Engine()
-        dummy_model = Classifier()
+        if "model_path" not in config:
+            raise ValueError("A model_path must be provided in the evaluation config.")
+
+        engine_default_values = get_class_default_params(Engine)
+        model_default_values = get_class_default_params(Classifier)
 
         engine_config = config.get("engine", {})
         engine_config.setdefault("model_path", config.get("model_path"))
-        engine_config.setdefault("nb_consecutive_frames", dummy_engine.nb_consecutive_frames)
-        engine_config.setdefault("conf_thresh", dummy_engine.conf_thresh)
-        engine_config.setdefault("max_bbox_size", dummy_model.max_bbox_size)
+        engine_config.setdefault("nb_consecutive_frames", engine_default_values["nb_consecutive_frames"])
+        engine_config.setdefault("conf_thresh", engine_default_values["conf_thresh"])
+        engine_config.setdefault("max_bbox_size", model_default_values["max_bbox_size"])
 
         model_config = config.get("model", {})
         model_config.setdefault("model_path", config.get("model_path"))
-        model_config.setdefault("iou", dummy_model.iou)
-        model_config.setdefault("conf", dummy_model.conf)
-        model_config.setdefault("imgsz", dummy_model.imgsz)
+        model_config.setdefault("iou", model_default_values["iou"])
+        model_config.setdefault("conf", model_default_values["conf"])
+        model_config.setdefault("imgsz", model_default_values["imgsz"])
 
         config.setdefault("eval", ["model", "engine"])
         config["engine"] = engine_config
-        config["model"] = engine_config
+        config["model"] = model_config
+
         return config
 
     def run(self):
@@ -113,6 +129,7 @@ class EvaluationPipeline:
                 )
         }
 
+        self.config["model"]["hash"] = self.model.hash
         self.metrics.update(
             {"config": self.config, "run_id": self.run_id, "dataset": dataset_info}
         )
